@@ -1,0 +1,6 @@
+# Compiled binaries
+*.exe
+server
+
+# Test / coverage output
+*.out
