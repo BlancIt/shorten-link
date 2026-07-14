@@ -1,44 +1,80 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
-	"sync"
+
+	_ "modernc.org/sqlite"
 )
 
 // -------------------------------------------- Storage --------------------------------------------
 
-// Holds the original URL mappings in memory.
+// Holds the original URL mappings in database (using SQLite).
 type store struct {
-	mu      sync.Mutex
-	urls    map[string]string // code -> long URL
-	counter uint64            // incrementing ID, encoded to base62 for the code
+	db *sql.DB
 }
+
+const createTableSQL = `
+CREATE TABLE IF NOT EXISTS links (
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	code       TEXT UNIQUE,
+	original_url   TEXT NOT NULL,
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`
 
 // Initialize store
-func newStore() *store {
-	return &store{urls: make(map[string]string)}
+func newStore(path string) (*store, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(createTableSQL); err != nil {
+		return nil, err
+	}
+	return &store{db: db}, nil
 }
 
-// Stores a URL under a freshly generated code and returns it. Uses mutex to ensure only one goroutine accesses the map at a time.
-func (s *store) save(longURL string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// Stores a URL on database, get its code from the row id, and returns the code.
+func (s *store) save(originalURL string) (string, error) {
+	res, err := s.db.Exec(
+		"INSERT INTO links (original_url) VALUES (?)",
+		originalURL,
+	)
+	if err != nil {
+		return "", err
+	}
 
-	s.counter++
-	code := toBase62(s.counter)
-	s.urls[code] = longURL
-	return code
+	id, err := res.LastInsertId()
+	if err != nil {
+		return "", err
+	}
+
+	code := toBase62(uint64(id))
+
+	_, err = s.db.Exec(
+		"UPDATE links SET code = ? WHERE id = ?",
+		code, id,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return code, nil
 }
 
-// Looks up a code. The bool is false if the code doesn't exist. Also uses mutex.
+// Looks up a code. The bool is false if the code doesn't exist.
 func (s *store) get(code string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	longURL, ok := s.urls[code]
-	return longURL, ok
+	var originalURL string
+	err := s.db.QueryRow(
+		"SELECT original_url FROM links WHERE code = ?",
+		code,
+	).Scan(&originalURL)
+	if err != nil {
+		return "", false
+	}
+	return originalURL, true
 }
 
 // -------------------------------------------- Base62 encoding --------------------------------------------
@@ -88,7 +124,11 @@ func (a *app) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := a.store.save(req.URL)
+	code, err := a.store.save(req.URL)
+	if err != nil {
+		http.Error(w, "could not save URL", http.StatusInternalServerError)
+		return
+	}
 
 	resp := shortenResponse{
 		Code:     code,
@@ -101,18 +141,24 @@ func (a *app) shortenHandler(w http.ResponseWriter, r *http.Request) {
 // Handles GET /{code} and redirects to the original URL.
 func (a *app) redirectHandler(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code") // pulls "{code}" out of the route pattern
-	longURL, ok := a.store.get(code)
+	originalURL, ok := a.store.get(code)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	http.Redirect(w, r, longURL, http.StatusFound)
+	http.Redirect(w, r, originalURL, http.StatusFound)
 }
 
 // -------------------------------------------- Main Program -------------------------------------------- 
 
+// Uses mutex to ensure only one goroutine accesses the map at a time.
 func main() {
-	a := &app{store: newStore()}
+	st, err := newStore("shorten.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	a := &app{store: st}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /shorten", a.shortenHandler)
