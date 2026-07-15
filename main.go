@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -27,12 +29,15 @@ CREATE TABLE IF NOT EXISTS links (
 // Initialize store
 func newStore(path string) (*store, error) {
 	db, err := sql.Open("sqlite", path)
+
 	if err != nil {
 		return nil, err
 	}
+
 	if _, err := db.Exec(createTableSQL); err != nil {
 		return nil, err
 	}
+
 	return &store{db: db}, nil
 }
 
@@ -42,11 +47,13 @@ func (s *store) save(originalURL string) (string, error) {
 		"INSERT INTO links (original_url) VALUES (?)",
 		originalURL,
 	)
+
 	if err != nil {
 		return "", err
 	}
 
 	id, err := res.LastInsertId()
+
 	if err != nil {
 		return "", err
 	}
@@ -57,6 +64,7 @@ func (s *store) save(originalURL string) (string, error) {
 		"UPDATE links SET code = ? WHERE id = ?",
 		code, id,
 	)
+
 	if err != nil {
 		return "", err
 	}
@@ -86,12 +94,34 @@ func toBase62(n uint64) string {
 	if n == 0 {
 		return "0"
 	}
+
 	var b []byte
+
 	for n > 0 {
 		b = append([]byte{base62Alphabet[n%62]}, b...)
 		n /= 62
 	}
+
 	return string(b)
+}
+
+// -------------------------------------------- Validation --------------------------------------------
+
+// Reports whether a string is a valid URL (Must be http/https and have a host).
+func isValidURL(s string) bool {
+	u, err := url.ParseRequestURI(s)
+	if err != nil {
+		return false
+	}
+
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.Host == "" {
+		return false
+	}
+
+	return true
 }
 
 // -------------------------------------------- HTTP handlers --------------------------------------------
@@ -119,12 +149,21 @@ func (a *app) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
 	}
+
+	req.URL = strings.TrimSpace(req.URL)
+
 	if req.URL == "" {
 		http.Error(w, "missing 'url' field", http.StatusBadRequest)
 		return
 	}
 
+	if !isValidURL(req.URL) {
+		http.Error(w, "invalid url: must be a valid http or https URL", http.StatusBadRequest)
+		return
+	}
+
 	code, err := a.store.save(req.URL)
+
 	if err != nil {
 		http.Error(w, "could not save URL", http.StatusInternalServerError)
 		return
@@ -134,6 +173,7 @@ func (a *app) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		Code:     code,
 		ShortURL: "http://localhost:8080/" + code,
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -149,7 +189,7 @@ func (a *app) redirectHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, originalURL, http.StatusFound)
 }
 
-// -------------------------------------------- Main Program -------------------------------------------- 
+// -------------------------------------------- Main Program --------------------------------------------
 
 // Uses mutex to ensure only one goroutine accesses the map at a time.
 func main() {
