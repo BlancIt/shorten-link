@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -23,7 +24,8 @@ CREATE TABLE IF NOT EXISTS links (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	code       TEXT UNIQUE,
 	original_url   TEXT NOT NULL,
-	created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+	expires_at DATETIME
 );`
 
 // Initialize store
@@ -42,10 +44,10 @@ func newStore(path string) (*store, error) {
 }
 
 // Stores a URL on database, get its code from the row id, and returns the code.
-func (s *store) save(originalURL string) (string, error) {
+func (s *store) save(originalURL string, expiresAt *time.Time) (string, error) {
 	res, err := s.db.Exec(
-		"INSERT INTO links (original_url) VALUES (?)",
-		originalURL,
+		"INSERT INTO links (original_url, expires_at) VALUES (?, ?)",
+		originalURL, expiresAt,
 	)
 
 	if err != nil {
@@ -72,14 +74,28 @@ func (s *store) save(originalURL string) (string, error) {
 	return code, nil
 }
 
+// Stores a URL on database with specific/custom code.
+func (s *store) saveWithCode(code, originalURL string, expiresAt *time.Time) error {
+	_, err := s.db.Exec(
+		"INSERT INTO links (code, original_url, expires_at) VALUES (?, ?, ?)",
+		code, originalURL, expiresAt,
+	)
+	return err
+}
+
 // Looks up a code. The bool is false if the code doesn't exist.
 func (s *store) get(code string) (string, bool) {
 	var originalURL string
+	var expiresAt *time.Time
 	err := s.db.QueryRow(
-		"SELECT original_url FROM links WHERE code = ?",
+		"SELECT original_url, expires_at FROM links WHERE code = ?",
 		code,
-	).Scan(&originalURL)
+	).Scan(&originalURL, &expiresAt)
 	if err != nil {
+		return "", false // not found
+	}
+	// Expired?
+	if expiresAt != nil && time.Now().After(*expiresAt) {
 		return "", false
 	}
 	return originalURL, true
@@ -107,7 +123,7 @@ func toBase62(n uint64) string {
 
 // -------------------------------------------- Validation --------------------------------------------
 
-// Reports whether a string is a valid URL (Must be http/https and have a host).
+// Checks whether a string is a valid URL (Must be http/https and have a host).
 func isValidURL(s string) bool {
 	u, err := url.ParseRequestURI(s)
 	if err != nil {
@@ -124,11 +140,30 @@ func isValidURL(s string) bool {
 	return true
 }
 
+// Checks whether an alias is safe to use as a short code.
+func isValidAlias(s string) bool {
+	if len(s) < 5 || len(s) > 20 {
+		return false
+	}
+
+	for _, r := range s {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		if !isLetter && !isDigit && r != '-' && r != '_' {
+			return false
+		}
+	}
+	
+	return true
+}
+
 // -------------------------------------------- HTTP handlers --------------------------------------------
 
 // JSON request from POST /shorten.
 type shortenRequest struct {
-	URL string `json:"url"`
+	URL       string `json:"url"`
+	Alias     string `json:"alias"`
+	ExpiresIn int    `json:"expires_in"` // optional
 }
 
 // JSON response for the shortened url link.
@@ -145,6 +180,9 @@ type app struct {
 // Handles POST /shorten.
 func (a *app) shortenHandler(w http.ResponseWriter, r *http.Request) {
 	var req shortenRequest
+	var expiresAt *time.Time
+	var code string
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON body", http.StatusBadRequest)
 		return
@@ -162,11 +200,30 @@ func (a *app) shortenHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code, err := a.store.save(req.URL)
+	if req.ExpiresIn > 0 {
+		t := time.Now().Add(time.Duration(req.ExpiresIn) * time.Second)
+		expiresAt = &t
+	}
 
-	if err != nil {
-		http.Error(w, "could not save URL", http.StatusInternalServerError)
-		return
+	if req.Alias != "" {
+		if !isValidAlias(req.Alias) {
+			http.Error(w, "invalid alias: 5-20 chars, letters/digits/-/_ only", http.StatusBadRequest)
+			return
+		}
+
+		if err := a.store.saveWithCode(req.Alias, req.URL, expiresAt); err != nil {
+			http.Error(w, "alias already taken", http.StatusConflict) // 409
+			return
+		}
+		code = req.Alias
+	} else {
+		var err error
+		code, err = a.store.save(req.URL, expiresAt)
+
+		if err != nil {
+			http.Error(w, "could not save URL", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	resp := shortenResponse{
@@ -191,7 +248,6 @@ func (a *app) redirectHandler(w http.ResponseWriter, r *http.Request) {
 
 // -------------------------------------------- Main Program --------------------------------------------
 
-// Uses mutex to ensure only one goroutine accesses the map at a time.
 func main() {
 	st, err := newStore("shorten.db")
 	if err != nil {
