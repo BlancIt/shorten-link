@@ -19,13 +19,24 @@ type store struct {
 	db *sql.DB
 }
 
+// Holds the info returned by GET /stats/{code}.
+type stats struct {
+	Code        string     `json:"code"`
+	OriginalURL string     `json:"original_url"`
+	Clicks      int        `json:"clicks"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at"` // null if never expires
+}
+
+// Query for initializing links table
 const createTableSQL = `
 CREATE TABLE IF NOT EXISTS links (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	code       TEXT UNIQUE,
 	original_url   TEXT NOT NULL,
 	created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-	expires_at DATETIME
+	expires_at DATETIME,
+	clicks     INTEGER NOT NULL DEFAULT 0
 );`
 
 // Initialize store
@@ -80,6 +91,7 @@ func (s *store) saveWithCode(code, originalURL string, expiresAt *time.Time) err
 		"INSERT INTO links (code, original_url, expires_at) VALUES (?, ?, ?)",
 		code, originalURL, expiresAt,
 	)
+
 	return err
 }
 
@@ -87,18 +99,41 @@ func (s *store) saveWithCode(code, originalURL string, expiresAt *time.Time) err
 func (s *store) get(code string) (string, bool) {
 	var originalURL string
 	var expiresAt *time.Time
+
 	err := s.db.QueryRow(
 		"SELECT original_url, expires_at FROM links WHERE code = ?",
 		code,
 	).Scan(&originalURL, &expiresAt)
+
 	if err != nil {
 		return "", false // not found
 	}
-	// Expired?
+
 	if expiresAt != nil && time.Now().After(*expiresAt) {
 		return "", false
 	}
+	
 	return originalURL, true
+}
+
+// Increases the click count for a code.
+func (s *store) incrementClicks(code string) {
+	_, _ = s.db.Exec("UPDATE links SET clicks = clicks + 1 WHERE code = ?", code)
+}
+
+// Returns stats for a code; false if it doesn't exist.
+func (s *store) getStats(code string) (stats, bool) {
+	var st stats
+	err := s.db.QueryRow(
+		"SELECT code, original_url, clicks, created_at, expires_at FROM links WHERE code = ?",
+		code,
+	).Scan(&st.Code, &st.OriginalURL, &st.Clicks, &st.CreatedAt, &st.ExpiresAt)
+
+	if err != nil {
+		return stats{}, false
+	}
+
+	return st, true
 }
 
 // -------------------------------------------- Base62 encoding --------------------------------------------
@@ -126,6 +161,7 @@ func toBase62(n uint64) string {
 // Checks whether a string is a valid URL (Must be http/https and have a host).
 func isValidURL(s string) bool {
 	u, err := url.ParseRequestURI(s)
+
 	if err != nil {
 		return false
 	}
@@ -133,6 +169,7 @@ func isValidURL(s string) bool {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return false
 	}
+
 	if u.Host == "" {
 		return false
 	}
@@ -237,13 +274,30 @@ func (a *app) shortenHandler(w http.ResponseWriter, r *http.Request) {
 
 // Handles GET /{code} and redirects to the original URL.
 func (a *app) redirectHandler(w http.ResponseWriter, r *http.Request) {
-	code := r.PathValue("code") // pulls "{code}" out of the route pattern
+	code := r.PathValue("code")
 	originalURL, ok := a.store.get(code)
+
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
+
+	a.store.incrementClicks(code)  
 	http.Redirect(w, r, originalURL, http.StatusFound)
+}
+
+// Handles GET /stats/{code}.
+func (a *app) statsHandler(w http.ResponseWriter, r *http.Request) {
+	code := r.PathValue("code")
+	st, ok := a.store.getStats(code)
+
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(st)
 }
 
 // -------------------------------------------- Main Program --------------------------------------------
@@ -259,6 +313,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /shorten", a.shortenHandler)
 	mux.HandleFunc("GET /{code}", a.redirectHandler)
+	mux.HandleFunc("GET /stats/{code}", a.statsHandler)
 
 	addr := ":8080"
 	log.Printf("server listening on http://localhost%s", addr)
